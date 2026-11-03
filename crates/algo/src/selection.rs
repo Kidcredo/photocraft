@@ -53,9 +53,10 @@ pub fn mask_from_surface(s: Option<&Surface>, area: Rect) -> Vec<f32> {
                     let tc = TileCoord::containing(x, y);
                     let x1 = (tc.rect().x1).min(area.x1);
                     let dst = row.get_mut((x - area.x0) as usize..(x1 - area.x0) as usize).unwrap_or_default();
-                    let src = s.tile(tc).and_then(|t| {
+                    let guard = s.tile(tc).map(|t| t.bytes());
+                    let src = guard.as_deref().and_then(|bytes| {
                         let base = (y - tc.ty * TILE_SIZE) as usize * TILE_SIZE as usize + (x - tc.tx * TILE_SIZE) as usize;
-                        t.bytes().get(base..base + dst.len())
+                        bytes.get(base..base + dst.len())
                     });
                     match src {
                         Some(src) => dst.iter_mut().zip(src).for_each(|(d, b)| *d = lut[*b as usize]),
@@ -115,7 +116,7 @@ fn surface_from_masks(area: Rect, new: &[f32], prev: Option<&[f32]>, f: impl Fn(
         let tr = tc.rect().intersect(&area);
         let (lx, span) = ((tr.x0 - area.x0) as usize, tr.width() as usize);
         let mut tile = Arc::clone(blank);
-        let data = Arc::make_mut(&mut tile).bytes_mut();
+        let mut data = Arc::make_mut(&mut tile).bytes_mut();
         let (mut lo, mut hi) = (if tr == tc.rect() { u8::MAX } else { 0 }, 0u8);
         for y in tr.y0..tr.y1 {
             let o = (y - tc.ty * TILE_SIZE) as usize * ts + (tr.x0 - tc.tx * TILE_SIZE) as usize;
@@ -123,6 +124,7 @@ fn surface_from_masks(area: Rect, new: &[f32], prev: Option<&[f32]>, f: impl Fn(
             row((y - area.y0) as usize * w + lx, dst);
             (lo, hi) = dst.iter().fold((lo, hi), |(lo, hi), b| (lo.min(*b), hi.max(*b)));
         }
+        drop(data);
         (hi > 0).then(|| (*tc, if lo == u8::MAX { Arc::clone(&full) } else { tile }))
     });
     s.put_tiles(built.into_iter().flatten());
@@ -134,10 +136,22 @@ pub fn mask_to_surface(m: &[f32], area: Rect) -> Surface {
     surface_from_masks(area, m, None, |_, v| v)
 }
 
+mod combine_mask;
+pub use combine_mask::combine_band;
+
 /// Combines `new` with `old` by `mode`. Returns `None` when nothing is selected.
 pub fn combine(old: Option<&Surface>, new: &[f32], area: Rect, mode: SelectionMode) -> Option<Surface> {
     if area.is_empty() {
         return None;
+    }
+    // Replace already writes straight from the input mask to tiles; it needs no old mask.
+    if mode == SelectionMode::Replace || (old.is_none() && mode == SelectionMode::Add) {
+        let s = mask_to_surface(new, area);
+        return (s.tile_count() > 0).then_some(s);
+    }
+    let old = old?;
+    if old.format() == PixelFormat::GRAY8 {
+        return combine_mask::gray8(Some(old), new, area, mode, false);
     }
     // Quantize to the 8-bit grid selections are stored on, so combining a mask with itself is
     // exact. Below half an 8-bit step is nothing.
@@ -145,7 +159,7 @@ pub fn combine(old: Option<&Surface>, new: &[f32], area: Rect, mode: SelectionMo
     let s = match mode {
         SelectionMode::Replace => surface_from_masks(area, new, None, |_, v| v),
         _ => {
-            let prev = mask_from_surface(old, area);
+            let prev = mask_from_surface(Some(old), area);
             match mode {
                 SelectionMode::Add => surface_from_masks(area, new, Some(&prev), |p, v| p.max(q(v))),
                 SelectionMode::Subtract => surface_from_masks(area, new, Some(&prev), |p, v| (p - q(v)).max(0.0)),
@@ -381,6 +395,9 @@ pub fn combine_region(old: Option<&Surface>, new: Option<&Region>, mode: Selecti
     let empty = Region { bbox: Rect::EMPTY, mask: Vec::new() };
     let new = new.unwrap_or(&empty);
     let b = new.bbox;
+    if old.is_none_or(|s| s.format() == PixelFormat::GRAY8) {
+        return combine_mask::gray8_bytes(old, &new.mask, b, mode);
+    }
     let prev_u8 = |s: &Surface| -> Vec<u8> {
         let mut v = Vec::new();
         s.read_region_into(b, &mut v);
@@ -761,27 +778,27 @@ pub fn tone_range(px: &[[f32; 4]], lo: f32, hi: f32, falloff: f32) -> Vec<f32> {
 }
 
 mod distance;
+mod inverse;
 mod lasso;
 mod marquee;
+mod morphology;
 
 pub use distance::edt;
+pub use inverse::inverse_surface;
 pub(crate) use lasso::clip_segment;
 pub use lasso::{MAX_PAINTED_TILES, polygon_edge_tiles, polygon_surface};
 pub use marquee::{combine_sparse, combine_surfaces, ellipse_surface};
 
 /// Grows the selection by `r` pixels.
+/// Invalid dimensions or nonfinite/negative radii return an empty buffer.
 pub fn expand(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
-    let inside: Vec<bool> = m.iter().map(|v| *v >= 0.5).collect();
-    let d = edt(&inside, w, h);
-    // A pixel whose centre is `d` away from the nearest selected centre is
-    // covered when d ≤ r (fractional radii give partial coverage).
-    m.iter().zip(d).map(|(v, d)| v.max((r + 1.0 - d).clamp(0.0, 1.0))).collect()
+    morphology::modify(m, w, h, r, morphology::Kind::Expand)
 }
 
 /// Shrinks the selection by `r` pixels.
+/// Invalid dimensions or nonfinite/negative radii return an empty buffer.
 pub fn contract(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
-    let inv: Vec<f32> = m.iter().map(|v| 1.0 - v).collect();
-    expand(&inv, w, h, r).into_iter().map(|v| 1.0 - v).collect()
+    morphology::modify(m, w, h, r, morphology::Kind::Contract)
 }
 
 /// Select › Modify › Border: a soft band `2r` wide centred on the selection edge, as in
@@ -790,14 +807,9 @@ pub fn contract(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
 /// either side (measured on Photoshop 27.11, Border 4: 63, 127, 191, 255 | 255, 191, 127, 63
 /// across a straight edge, the same along the inside of a corner). It used to be a hard band
 /// `r` wide.
+/// Invalid dimensions or nonfinite/negative radii return an empty buffer.
 pub fn border(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
-    let inside: Vec<bool> = m.iter().map(|v| *v >= 0.5).collect();
-    let outside: Vec<bool> = inside.iter().map(|v| !v).collect();
-    let (to_inside, to_outside) = (edt(&inside, w, h), edt(&outside, w, h));
-    if r <= 0.0 || to_inside.len() != m.len() || to_outside.len() != m.len() {
-        return vec![0.0; m.len()];
-    }
-    inside.iter().zip(to_inside.iter().zip(&to_outside)).map(|(&sel, (&di, &dout))| (1.0 - ((if sel { dout } else { di }) - 1.0) / r).clamp(0.0, 1.0)).collect()
+    morphology::modify(m, w, h, r, morphology::Kind::Border)
 }
 
 /// Smooth: removes specks and rounds corners (box average of radius `round(r)`, edges
@@ -811,6 +823,13 @@ pub fn smooth(m: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
 /// radius (#211).
 pub fn feather(m: &[f32], w: usize, h: usize, radius: f32) -> Vec<f32> {
     crate::selection_blur::feather(m, w, h, radius)
+}
+
+/// How far [`feather`] spreads, in pixels (`⌈3σ⌉` with σ = `radius`, 0 when it changes nothing).
+/// Samples farther than this from every nonzero sample stay 0, so a working window grown by this
+/// much gives the same result as the whole canvas.
+pub fn feather_reach(radius: f32) -> usize {
+    crate::selection_blur::feather_reach(radius)
 }
 
 /// Anti-aliased polygon (even-odd) coverage over `area`: exact horizontal
